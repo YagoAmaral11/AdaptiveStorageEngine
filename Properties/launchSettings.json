@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "AdaptiveStorageEngine": {
+      "commandName": "Project"
+    },
+    "Exec Test.jsonl": {
+      "commandName": "Project",
+      "commandLineArgs": "test.jsonl"
+    }
+  }
+}

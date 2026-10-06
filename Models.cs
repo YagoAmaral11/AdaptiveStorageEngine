@@ -4,12 +4,14 @@ using System.Text;
 
 namespace AdaptiveStorageEngine;
 
+
 public enum OperationType
 {
     put,
     get,
     delete,
-    scan
+    scan,
+    error
 }
 
 public enum ResponseType
@@ -23,7 +25,15 @@ public record PutRequest(ulong id, OperationType op, ulong key, string value) : 
 public record GetRequest(ulong id, OperationType op, ulong key) : Request(id, op);
 public record RemoveRequest(ulong id, OperationType op, ulong key) : Request(id, op);
 public record ScanRequest(ulong id, OperationType op, ulong start, ulong end) : Request(id, op);
+public record ErroredRequest(ulong id, OperationType op, string error, string rawJson) : Request(id, op);
 
 public record SimpleResponse(ulong id, ResponseType response); // Usado nas respostas de Put e Remove
 public record GetResponse(ulong id, ResponseType response, string value);
 // TODO: Scan Request
+
+
+public struct Page
+{
+    public ulong nextPageID;
+    public string content;
+}
