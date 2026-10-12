@@ -13,6 +13,7 @@ public static class Engine
     private static readonly Queue<Request> RequestQueue = [];
     private static readonly object PageFileHandleLock = new();
     private static readonly SemaphoreSlim PageAllocationLock = new(1, 1);
+    private static readonly SemaphoreSlim MetadataLock = new(1, 1);
     private static SafeFileHandle? pageFileHandle;
 
     private static int queueCapacity = 10;    
@@ -73,8 +74,99 @@ public static class Engine
         }
     }
 
-    // TODO: Atualizar a tabela de páginas, tanto na memória principal quanto na secundária
-    public static async Task<ulong> CreateInformationAsync(string information, CancellationToken cancellationToken = default)
+    private static async Task InsertPageTableEntryAsync(ulong informationId, ulong firstPageId, CancellationToken cancellationToken = default)
+    {
+        const int pagePointerSize = sizeof(ulong);
+        const int firstPageHeaderSize = sizeof(ulong) + sizeof(uint);
+        const int entrySize = sizeof(ulong) * 2;
+        const int firstPageEntriesPerPage = (4096 - firstPageHeaderSize) / entrySize;
+        const int continuationPageEntriesPerPage = (4096 - pagePointerSize) / entrySize;
+
+        await MetadataLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            if (metadata.pageTable.ContainsKey(informationId))
+                throw new InvalidOperationException($"A informação com ID {informationId} já existe.");
+
+            ulong currentPageId = 0;
+            uint entriesBeforeCurrentPage = 0;
+            bool firstPage = true;
+            var visitedPages = new HashSet<ulong>();
+
+            while (true)
+            {
+                if (!visitedPages.Add(currentPageId))
+                    throw new InvalidDataException("Foi encontrado um ciclo inválido na cadeia da metadata.");
+
+                byte[] currentPage = await ReadPageAsync(currentPageId, pageSize, cancellationToken);
+                ulong nextPageId = BinaryPrimitives.ReadUInt64LittleEndian(currentPage.AsSpan(0, pagePointerSize));
+                int contentOffset = firstPage ? firstPageHeaderSize : pagePointerSize;
+                int entriesPerCurrentPage = firstPage ? firstPageEntriesPerPage : continuationPageEntriesPerPage;
+                uint entriesInCurrentPage = metadata.pageTableSize - entriesBeforeCurrentPage;
+
+                if (entriesInCurrentPage < entriesPerCurrentPage)
+                {
+                    int entryOffset = checked(contentOffset + (int)entriesInCurrentPage * entrySize);
+                    await WritePageTableEntryAsync(currentPageId, entryOffset, informationId, firstPageId, cancellationToken);
+                    break;
+                }
+
+                if (nextPageId == currentPageId)
+                {
+                    ulong newPageId = await CreateEmptyPageAsync(cancellationToken);
+                    byte[] newPage = new byte[pageSize];
+                    BinaryPrimitives.WriteUInt64LittleEndian(newPage.AsSpan(0, pagePointerSize), newPageId);
+                    WritePageTableEntry(newPage, pagePointerSize, informationId, firstPageId);
+
+                    long newPageOffset = checked((long)newPageId * pageSize);
+                    await RandomAccess.WriteAsync(GetPageFileHandle(), newPage.AsMemory(), newPageOffset, cancellationToken);
+
+                    byte[] nextPageBytes = new byte[pagePointerSize];
+                    BinaryPrimitives.WriteUInt64LittleEndian(nextPageBytes, newPageId);
+                    long currentPageOffset = checked((long)currentPageId * pageSize);
+                    await RandomAccess.WriteAsync(GetPageFileHandle(), nextPageBytes.AsMemory(), currentPageOffset, cancellationToken);
+
+                    if (currentPageId == 0)
+                        metadata.nextPageId = newPageId;
+
+                    break;
+                }
+
+                entriesBeforeCurrentPage = checked(entriesBeforeCurrentPage + (uint)entriesPerCurrentPage);
+                currentPageId = nextPageId;
+                firstPage = false;
+            }
+
+            uint newPageTableSize = checked(metadata.pageTableSize + 1);
+            byte[] sizeBytes = new byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, newPageTableSize);
+            await RandomAccess.WriteAsync(GetPageFileHandle(), sizeBytes.AsMemory(), sizeof(ulong), cancellationToken);
+
+            metadata.pageTable.Add(informationId, firstPageId);
+            metadata.pageTableSize = newPageTableSize;
+        }
+        finally
+        {
+            MetadataLock.Release();
+        }
+    }
+
+    private static async Task WritePageTableEntryAsync(ulong pageId, int offset, ulong informationId, ulong firstPageId, CancellationToken cancellationToken)
+    {
+        byte[] entry = new byte[sizeof(ulong) * 2];
+        WritePageTableEntry(entry, 0, informationId, firstPageId);
+        long fileOffset = checked((long)pageId * pageSize + offset);
+        await RandomAccess.WriteAsync(GetPageFileHandle(), entry.AsMemory(), fileOffset, cancellationToken);
+    }
+
+    private static void WritePageTableEntry(byte[] page, int offset, ulong informationId, ulong firstPageId)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset, sizeof(ulong)), informationId);
+        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset + sizeof(ulong), sizeof(ulong)), firstPageId);
+    }
+
+    public static async Task<ulong> CreateInformationAsync(ulong informationId, string information, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(information);
 
@@ -113,7 +205,45 @@ public static class Engine
             await RandomAccess.WriteAsync(handle, page.AsMemory(), pageOffset, cancellationToken);
         }
 
+        await InsertPageTableEntryAsync(informationId, pageIds[0], cancellationToken);
         return pageIds[0];
+    }
+
+    public static ulong GetInformationFirstPageId(ulong informationId)
+    {
+        if (!metadata.pageTable.TryGetValue(informationId, out ulong firstPageId))
+            throw new KeyNotFoundException($"A informação com ID {informationId} não foi encontrada na pageTable.");
+
+        return firstPageId;
+    }
+
+    public static async Task<string> ReadInformationAsync(ulong firstPageId, CancellationToken cancellationToken = default)
+    {
+        const int pagePointerSize = sizeof(ulong);
+        var informationBytes = new List<byte>();
+        var visitedPages = new HashSet<ulong>();
+        ulong currentPageId = firstPageId;
+
+        while (true)
+        {
+            if (!visitedPages.Add(currentPageId))
+                throw new InvalidDataException("Foi encontrado um ciclo inválido nas páginas da informação.");
+
+            byte[] page = await ReadPageAsync(currentPageId, pageSize, cancellationToken);
+            ulong nextPageId = BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(0, pagePointerSize));
+            informationBytes.AddRange(page.AsSpan(pagePointerSize).ToArray());
+
+            if (nextPageId == currentPageId)
+                break;
+
+            currentPageId = nextPageId;
+        }
+
+        int contentLength = informationBytes.Count;
+        while (contentLength > 0 && informationBytes[contentLength - 1] == 0)
+            contentLength--;
+
+        return Encoding.UTF8.GetString(informationBytes.ToArray(), 0, contentLength);
     }
 
     public static void AddRequest(Request request)
@@ -301,8 +431,7 @@ public static class Engine
                 FileOptions.Asynchronous);
         }
     }
-    
-    // TODO: Função para retornar um valor guardado, lendo continuamente páginas e construir uma string    
+        
     // TODO: Função para apagar um informação de um ID, continuamente apagando todas as páginas dessa informação
     // TODO: Guardar uma tabela com todas as páginas que não estão sendo usadas atualmente para guardar informações, e quando criar novas páginas
     //       puxar a primeira página zerada marcada como livre
