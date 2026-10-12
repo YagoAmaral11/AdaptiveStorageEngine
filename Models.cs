@@ -37,3 +37,10 @@ public struct Page
     public ulong nextPageID;
     public string content;
 }
+
+public class Metadata
+{
+    public ulong nextPageId; // o ponteiro para a próxima página dos metadados 
+    public uint pageTableSize; // o tamanho da pageTable, que é a quantidade do par (64 bits da chave + 64 bits do id da página)
+    public Dictionary<ulong, ulong> pageTable = []; // A tabela de páginas; O ID do elemento guardado aponta para o ID da primeira página desse elemento
+}

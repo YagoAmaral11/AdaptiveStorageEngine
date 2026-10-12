@@ -5,16 +5,18 @@ namespace AdaptiveStorageEngine;
 public class Program
 {
 
-    public static int Main(string[] args)
+    public static async Task<int> Main(string[] args)
     {
         if (args.Length == 0)
         {
             Console.Error.WriteLine("Informe o caminho do arquivo JSONL como primeiro argumento.");
             return 1;
-        }
+        }        
 
         try
         {
+            await Engine.Initialize();
+
             using StreamReader input = File.OpenText(args[0]);
 
             string? line;
@@ -36,6 +38,11 @@ public class Program
         {
             Console.Error.WriteLine($"Não foi possível acessar o arquivo de entrada: {exception.Message}");
             return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e);
+            return -1;
         }
     }
 
