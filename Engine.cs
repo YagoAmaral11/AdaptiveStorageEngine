@@ -431,16 +431,16 @@ public static class Engine
                 FileOptions.Asynchronous);
         }
     }
-        
+
 
     // TODO: Função para apagar um informação de um ID, continuamente apagando todas as páginas dessa informação
     // TODO: Guardar uma tabela com todas as páginas que não estão sendo usadas atualmente para guardar informações, e quando criar novas páginas
-    //       puxar a primeira página zerada marcada como livre
+    //       puxar a primeira página zerada marcada como livre    
+    // TODO: Implementar o ProcessQueue para processar os diferentes tipos de request 
+    // TODO: Implementar um método para escrever o arquivo final de resposta para todos os requests (.jsonl de respostas de todos os requests)
     // TODO: Implementar uma cache à nível de informação, mantendo as informações mais acessadas na memória principal. Se essa memória for atualizada,
     //       atualizar ela na memória secundária também
     // TODO: Implementar uma cache à nível de páginas, mantendo as páginas mais acessadas na memória principal. Se essa página for atualizada, 
     //       atualizar ela na memória secundária também    
-    // TODO: Implementar o ProcessQueue para processar os diferentes tipos de request 
-    // TODO: Implementar um método para escrever o arquivo final de resposta para todos os requests (.jsonl de respostas de todos os requests)
 
 }
