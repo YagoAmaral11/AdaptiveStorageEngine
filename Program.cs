@@ -13,9 +13,11 @@ public class Program
             return 1;
         }        
 
+        bool engineInitialized = false;
         try
         {
             await Engine.Initialize();
+            engineInitialized = true;
 
             using StreamReader input = File.OpenText(args[0]);
 
@@ -43,6 +45,11 @@ public class Program
         {
             Console.Error.WriteLine(e);
             return -1;
+        }
+        finally
+        {
+            if (engineInitialized)
+                await Engine.ShutdownAsync();
         }
     }
 
