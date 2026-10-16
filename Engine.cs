@@ -24,6 +24,15 @@ public static class Engine
     private static SafeFileHandle? pageFileHandle;        
 
     private static Metadata metadata = new();
+
+    private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        Converters =
+        {
+            new JsonStringEnumConverter()
+        }
+    };
     
     // TODO: Adicionar uma recuperação básica de erros, e salvar eventualmente a tabela de páginas/tombstones, efetivamente zerando a recuperação de erros
     // TODO: PROXIMAS ETAPAS -> Reorganizar e renomear funções, refatorar para melhor eficiência (freePageIntervals, por ex. sub. por um IntervalTree), criar classes para separar camadas da Engine
@@ -134,12 +143,8 @@ public static class Engine
     }
 
     private static void AppendResponse(object response)
-    {
-        JsonSerializerOptions options = new();
-
-        options.Converters.Add(new JsonStringEnumConverter());
-
-        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response, options) + Environment.NewLine);
+    {        
+        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response, ResponseSerializerOptions) + Environment.NewLine);
     }
 
     /// <summary>Cria uma página zerada no final do arquivo e retorna seu ID.</summary>
