@@ -1,6 +1,6 @@
+using Microsoft.Win32.SafeHandles;
 using System.Buffers.Binary;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
 
 namespace AdaptiveStorageEngine;
 
@@ -24,10 +24,19 @@ public static class Engine
 
     // TODO: Implementar o ProcessQueue para processar os diferentes tipos de request 
     // TODO: Implementar um método para escrever o arquivo final de resposta para todos os requests (.jsonl de respostas de todos os requests)
+    // TODO: Reorganizar e renomear funções, refatorar para melhor eficiência (freePageIntervals, por ex. sub. por um IntervalTree), criar classes para separar camadas da Engine
+    //       Com uma camada superior que processa a fila, gerencia as informações (chave-valor) e a mantém uma cache na memória para informações e as tabelas usadas
+    //       Com uma camada inferior que atualiza e gerencia diretamente o arquivo .db, criando páginas 
     // TODO: PROXIMAS ETAPAS -> Implementar uma cache à nível de informação, mantendo as informações mais acessadas na memória principal. Se essa memória for atualizada,
     //       atualizar ela na memória secundária também
     // TODO: PROXIMAS ETAPAS -> Implementar uma cache à nível de páginas, mantendo as páginas mais acessadas na memória principal. Se essa página for atualizada, 
     //       atualizar ela na memória secundária também    
+    // TODO: PROXIMAS ETAPAS -> NO FUTURO, CRIAR ALGUMA FORMA DE SALVAR A PAGE TABLE E A TOMBSTONE TABLE SEREM ATUALIZADAS SEMPRE QUANDO HOUVER UMA DELEÇÃO OU UMA ADIÇÃO.
+    //       UMA FORMA DE FAZER ISSO É MUDAR A FORMA/ESTRUTURA COMO ESSAS LISTAS/TABELAS SÃO SALVAS NAS PÁGINAS DO .DB, USANDO UMA E.D. EFICIENTE PARA BUSCA, ADIÇÃO E REMOÇÃO,
+    //       MAS QUE FUNCIONE COM A PAGINAÇÃO QUE ESTÁ SENDO FEITA.
+    //       UMA POSSÍVEL FORMA (E AÍ JÁ CONECTAR COM OUTRO SISTEMA QUE DEVE SER FEITO) É CRIAR UM SISTEMA DE RECUPERAÇÃO DE ERROS PARA SALVAR QUAIS FORAM AS MODIFICAÇÕES
+    //       E SÓ DE VEZ EM QUANDO REALMENTE ESCREVER A TABELA INTEIRA (COMO JÁ ESTÁ SENDO FEITO, MAS NO MOMENTO NÃO TERÁ RECUPERAÇÃO DE ERROS) NO .DB.
+    //       TALVEZ SEJA POSSÍVEL USAR UMA E.D.EDITAR/ATUALIZAR ELA O TEMPO INTEIRO EM TEMPO REAL    
 
 
     /// <summary>Inicializa o arquivo, o header da metadata e as duas tabelas em memória.</summary>

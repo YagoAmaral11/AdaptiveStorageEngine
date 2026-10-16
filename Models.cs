@@ -35,38 +35,47 @@ public record GetResponse(ulong id, ResponseType response, string value);
 
 public struct Page
 {
+    // OBS: A ordem dos membros aqui é a EXATA ordem em que os membros são serializados/deserializados da .db
+
+    public ulong nextPageID;
+    public string content;
+
     /// <summary>
     /// Tamanho, em bytes, do ponteiro para a próxima página nas páginas ordinárias.
     /// </summary>
     public static int HeaderSize => sizeof(ulong);
-
-    public ulong nextPageID;
-    public string content;
 }
 
 public class Metadata
 {
-    /// <summary>
-    /// Tamanho, em bytes, do header da página de metadata.
-    /// </summary>
-    public static int HeaderSize => sizeof(ulong) + sizeof(uint) + sizeof(ulong) + sizeof(uint);
+    // OBS: A ordem dos membros aqui é a EXATA ordem em que os membros são serializados/deserializados da .db
 
     public ulong pageTablePageId; // o ponteiro para a primeira página da pageTable
     public uint pageTableSize; // o tamanho da pageTable, que é a quantidade do par (64 bits da chave + 64 bits do id da página)
     public ulong tombstoneTablePageId; // o ponteiro para a primeira página da tombstoneTable
     public uint tombstoneTableSize; // quantidade de IDs na tombstoneTable
+
     public Dictionary<ulong, ulong> pageTable = new Dictionary<ulong, ulong>(); // A tabela de páginas; O ID do elemento guardado aponta para o ID da primeira página desse elemento    
     public List<ulong> tombstoneTable = new List<ulong>(); // IDs das páginas que podem ser reutilizadas.
     public FreePageIntervalIndex freePageIntervals = new FreePageIntervalIndex();
+
+    /// <summary>
+    /// Tamanho, em bytes, do header da página de metadata.
+    /// </summary>
+    public static int HeaderSize => sizeof(ulong) + sizeof(uint) + sizeof(ulong) + sizeof(uint);
 }
 
 public readonly record struct FreePageInterval(ulong FirstPageId, ulong Length)
 {
-    /// <summary>Obtém o ID da última página do intervalo.</summary>
+    /// <summary>
+    /// Obtém o ID da última página do intervalo.
+    /// </summary>
     public ulong LastPageId => checked(FirstPageId + Length - 1);
 }
 
-/// <summary>Índice ordenado dos intervalos contíguos de páginas livres.</summary>
+/// <summary>
+/// Índice ordenado dos intervalos contíguos de páginas livres.
+/// </summary>
 public sealed class FreePageIntervalIndex
 {
     private readonly SortedSet<FreePageInterval> intervals = new(
