@@ -18,7 +18,8 @@ public enum OperationType
 public enum ResponseType
 {
     ok,
-    not_found
+    not_found,
+    error
 }
 
 public record Request(ulong id, OperationType op);
@@ -29,7 +30,8 @@ public record ScanRequest(ulong id, OperationType op, ulong start, ulong end) : 
 public record ErroredRequest(ulong id, OperationType op, string error, string rawJson) : Request(id, op);
 
 public record SimpleResponse(ulong id, ResponseType response); // Usado nas respostas de Put e Remove
-public record GetResponse(ulong id, ResponseType response, string value);
+public record GetResponse(ulong id, ResponseType response, string? value);
+public record ErorResponse(ulong id, ResponseType response, string error, string rawJson);
 // TODO: Scan Request
 
 

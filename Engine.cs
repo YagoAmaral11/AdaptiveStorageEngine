@@ -1,6 +1,7 @@
 using Microsoft.Win32.SafeHandles;
 using System.Buffers.Binary;
 using System.Text;
+using System.Text.Json;
 
 namespace AdaptiveStorageEngine;
 
@@ -14,6 +15,7 @@ public static class Engine
     private static readonly Queue<Request> RequestQueue = [];
     private static int queueCapacity = 10;    
     public static int QueueCapacity => queueCapacity;
+    private static string responseFilePath = "responses.jsonl";
 
     private static readonly object PageFileHandleLock = new();
     private static readonly SemaphoreSlim PageAllocationLock = new(1, 1);
@@ -21,10 +23,9 @@ public static class Engine
     private static SafeFileHandle? pageFileHandle;        
 
     private static Metadata metadata = new();
-
-    // TODO: Implementar o ProcessQueue para processar os diferentes tipos de request 
-    // TODO: Implementar um método para escrever o arquivo final de resposta para todos os requests (.jsonl de respostas de todos os requests)
-    // TODO: Reorganizar e renomear funções, refatorar para melhor eficiência (freePageIntervals, por ex. sub. por um IntervalTree), criar classes para separar camadas da Engine
+    
+    // TODO: Adicionar uma recuperação básica de erros, e salvar eventualmente a tabela de páginas/tombstones, efetivamente zerando a recuperação de erros
+    // TODO: PROXIMAS ETAPAS -> Reorganizar e renomear funções, refatorar para melhor eficiência (freePageIntervals, por ex. sub. por um IntervalTree), criar classes para separar camadas da Engine
     //       Com uma camada superior que processa a fila, gerencia as informações (chave-valor) e a mantém uma cache na memória para informações e as tabelas usadas
     //       Com uma camada inferior que atualiza e gerencia diretamente o arquivo .db, criando páginas 
     // TODO: PROXIMAS ETAPAS -> Implementar uma cache à nível de informação, mantendo as informações mais acessadas na memória principal. Se essa memória for atualizada,
@@ -75,9 +76,66 @@ public static class Engine
             ProcessQueue();
     }
 
+    /// <summary>Define o caminho do arquivo JSONL de respostas.</summary>
+    /// <param name="path">Caminho do arquivo de respostas.</param>
+    public static void SetResponseFilePath(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        responseFilePath = path;
+    }
+
     /// <summary>Processa as requisições pendentes.</summary>
-    /// <exception cref="NotImplementedException">Lançada enquanto o processador de requisições não estiver implementado.</exception>
-    public static void ProcessQueue() => throw new NotImplementedException();
+    public static void ProcessQueue()
+    {
+        while (RequestQueue.Count > 0)
+        {
+            Request request = RequestQueue.Dequeue();
+            object response = request switch
+            {
+                PutRequest putRequest => ProcessPutRequest(putRequest),
+                GetRequest getRequest => ProcessGetRequest(getRequest),
+                RemoveRequest removeRequest => ProcessRemoveRequest(removeRequest),
+                ErroredRequest erroredRequest => new ErorResponse(erroredRequest.id, ResponseType.error, erroredRequest.error, erroredRequest.rawJson),
+                _ => new ErorResponse(request.id, ResponseType.error, $"Operação não suportada: {request.op}.", JsonSerializer.Serialize(request))
+            };
+
+            AppendResponse(response);
+        }
+    }
+
+    private static SimpleResponse ProcessPutRequest(PutRequest request)
+    {
+        if (metadata.pageTable.ContainsKey(request.key))
+            DeleteInformationAsync(request.key).GetAwaiter().GetResult();
+
+        CreateInformationAsync(request.key, request.value).GetAwaiter().GetResult();
+        return new SimpleResponse(request.id, ResponseType.ok);
+    }
+
+    private static GetResponse ProcessGetRequest(GetRequest request)
+    {
+        try
+        {
+            ulong firstPageId = GetInformationFirstPageId(request.key);
+            string value = ReadInformationAsync(firstPageId).GetAwaiter().GetResult();
+            return new GetResponse(request.id, ResponseType.ok, value);
+        }
+        catch (KeyNotFoundException)
+        {
+            return new GetResponse(request.id, ResponseType.not_found, null);
+        }
+    }
+
+    private static SimpleResponse ProcessRemoveRequest(RemoveRequest request)
+    {
+        DeleteInformationAsync(request.key).GetAwaiter().GetResult();
+        return new SimpleResponse(request.id, ResponseType.ok);
+    }
+
+    private static void AppendResponse(object response)
+    {
+        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response) + Environment.NewLine);
+    }
 
     /// <summary>Cria uma página zerada no final do arquivo e retorna seu ID.</summary>
     /// <param name="cancellationToken">Token usado para cancelar a operação.</param>
