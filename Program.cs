@@ -11,11 +11,32 @@ public class Program
         {
             Console.Error.WriteLine("Informe o caminho do arquivo JSONL como primeiro argumento.");
             return 1;
-        }        
+        }
 
+        string responseFilePath = "responses.jsonl";
+        for (int index = 1; index < args.Length; index++)
+        {
+            if (args[index] != "-o")
+            {
+                Console.Error.WriteLine($"Argumento desconhecido: {args[index]}.");
+                return 1;
+            }
+
+            if (index + 1 >= args.Length || string.IsNullOrWhiteSpace(args[++index]))
+            {
+                Console.Error.WriteLine("Informe o caminho do arquivo de resposta após a flag -o.");
+                return 1;
+            }
+
+            responseFilePath = args[index];
+        }
+
+        bool engineInitialized = false;
         try
         {
+            Engine.SetResponseFilePath(responseFilePath);
             await Engine.Initialize();
+            engineInitialized = true;
 
             using StreamReader input = File.OpenText(args[0]);
 
@@ -43,6 +64,11 @@ public class Program
         {
             Console.Error.WriteLine(e);
             return -1;
+        }
+        finally
+        {
+            if (engineInitialized)
+                await Engine.ShutdownAsync();
         }
     }
 

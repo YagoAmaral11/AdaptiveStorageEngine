@@ -6,6 +6,10 @@
     "Exec Test.jsonl": {
       "commandName": "Project",
       "commandLineArgs": "test.jsonl"
+    },
+    "Exec Test.jsonl -o output.jsonl": {
+      "commandName": "Project",
+      "commandLineArgs": "test.jsonl -o output.jsonl"
     }
   }
 }

@@ -1,72 +1,162 @@
-﻿using System.Buffers.Binary;
-using System.Text;
 using Microsoft.Win32.SafeHandles;
+using System.Buffers.Binary;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AdaptiveStorageEngine;
 
 public static class Engine
 {
     public const string DatabaseFileName = "database.dat";
-    private static readonly int pageSize = 4096; // 2 ^ 12
-
+    private const int PageSize = 4096; // 2 ^ 12
+    private const int PageTableEntrySize = sizeof(ulong) * 2;
+    private const int TombstoneEntrySize = sizeof(ulong);
 
     private static readonly Queue<Request> RequestQueue = [];
+    private static int queueCapacity = 10;    
+    public static int QueueCapacity => queueCapacity;
+    private static string responseFilePath = "responses.jsonl";
+
     private static readonly object PageFileHandleLock = new();
     private static readonly SemaphoreSlim PageAllocationLock = new(1, 1);
     private static readonly SemaphoreSlim MetadataLock = new(1, 1);
-    private static SafeFileHandle? pageFileHandle;
+    private static SafeFileHandle? pageFileHandle;        
 
-    private static int queueCapacity = 10;    
+    private static Metadata metadata = new();
+
+    private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        Converters =
+        {
+            new JsonStringEnumConverter()
+        }
+    };
+    
+    // TODO: Adicionar uma recuperação básica de erros, e salvar eventualmente a tabela de páginas/tombstones, efetivamente zerando a recuperação de erros
+    // TODO: PROXIMAS ETAPAS -> Reorganizar e renomear funções, refatorar para melhor eficiência (freePageIntervals, por ex. sub. por um IntervalTree), criar classes para separar camadas da Engine
+    //       Com uma camada superior que processa a fila, gerencia as informações (chave-valor) e a mantém uma cache na memória para informações e as tabelas usadas
+    //       Com uma camada inferior que atualiza e gerencia diretamente o arquivo .db, criando páginas 
+    // TODO: PROXIMAS ETAPAS -> Implementar uma cache à nível de informação, mantendo as informações mais acessadas na memória principal. Se essa memória for atualizada,
+    //       atualizar ela na memória secundária também
+    // TODO: PROXIMAS ETAPAS -> Implementar uma cache à nível de páginas, mantendo as páginas mais acessadas na memória principal. Se essa página for atualizada, 
+    //       atualizar ela na memória secundária também    
+    // TODO: PROXIMAS ETAPAS -> NO FUTURO, CRIAR ALGUMA FORMA DE SALVAR A PAGE TABLE E A TOMBSTONE TABLE SEREM ATUALIZADAS SEMPRE QUANDO HOUVER UMA DELEÇÃO OU UMA ADIÇÃO.
+    //       UMA FORMA DE FAZER ISSO É MUDAR A FORMA/ESTRUTURA COMO ESSAS LISTAS/TABELAS SÃO SALVAS NAS PÁGINAS DO .DB, USANDO UMA E.D. EFICIENTE PARA BUSCA, ADIÇÃO E REMOÇÃO,
+    //       MAS QUE FUNCIONE COM A PAGINAÇÃO QUE ESTÁ SENDO FEITA.
+    //       UMA POSSÍVEL FORMA (E AÍ JÁ CONECTAR COM OUTRO SISTEMA QUE DEVE SER FEITO) É CRIAR UM SISTEMA DE RECUPERAÇÃO DE ERROS PARA SALVAR QUAIS FORAM AS MODIFICAÇÕES
+    //       E SÓ DE VEZ EM QUANDO REALMENTE ESCREVER A TABELA INTEIRA (COMO JÁ ESTÁ SENDO FEITO, MAS NO MOMENTO NÃO TERÁ RECUPERAÇÃO DE ERROS) NO .DB.
+    //       TALVEZ SEJA POSSÍVEL USAR UMA E.D.EDITAR/ATUALIZAR ELA O TEMPO INTEIRO EM TEMPO REAL    
 
 
-    private static Metadata metadata = new(); // A metadata da database
-
-    private static Dictionary<ulong, Page> PageCache = []; // Uma cache das páginas carregadas
-    private static Dictionary<ulong, string> ValueCache = []; // A cache com os valores carregados    
-
-
-    public static int QueueCapacity => queueCapacity;
-
-
+    /// <summary>Inicializa o arquivo, o header da metadata e as duas tabelas em memória.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <exception cref="IOException">Lançada quando o arquivo não pode ser criado ou lido.</exception>
+    /// <exception cref="InvalidDataException">Lançada quando o layout do arquivo é inválido.</exception>
     public static async Task Initialize(CancellationToken cancellationToken = default)
     {
-        if (File.Exists(DatabaseFileName))
-        {
-            metadata = await LoadMetadataAsync(cancellationToken);
-        }
-        else
-        {
+        if (!File.Exists(DatabaseFileName))
             await CreateDatabaseFileAsync(cancellationToken);
 
-            metadata = new Metadata
-            {
-                nextPageId = 0,
-                pageTableSize = 0,
-                pageTable = []
-            };
-        }                        
+        metadata = await LoadMetadataAsync(cancellationToken);
     }
 
+    /// <summary>Salva as tabelas em memória no arquivo e fecha o handle do database.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a gravação.</param>
+    /// <exception cref="IOException">Lançada quando as tabelas não podem ser gravadas.</exception>
+    public static async Task ShutdownAsync(CancellationToken cancellationToken = default)
+    {
+        await SaveTablesAsync(cancellationToken);
+        lock (PageFileHandleLock)
+        {
+            pageFileHandle?.Dispose();
+            pageFileHandle = null;
+        }
+    }
+
+    /// <summary>Adiciona uma requisição à fila e processa a fila quando sua capacidade é atingida.</summary>
+    /// <param name="request">Requisição a ser adicionada.</param>
+    /// <exception cref="ArgumentNullException">Lançada quando a requisição é nula.</exception>
+    public static void AddRequest(Request request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        RequestQueue.Enqueue(request);
+        if (RequestQueue.Count >= QueueCapacity)
+            ProcessQueue();
+    }
+
+    /// <summary>Define o caminho do arquivo JSONL de respostas.</summary>
+    /// <param name="path">Caminho do arquivo de respostas.</param>
+    public static void SetResponseFilePath(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        responseFilePath = path;
+    }
+
+    /// <summary>Processa as requisições pendentes.</summary>
+    public static void ProcessQueue()
+    {
+        while (RequestQueue.Count > 0)
+        {
+            Request request = RequestQueue.Dequeue();
+            object response = request switch
+            {
+                PutRequest putRequest => ProcessPutRequest(putRequest),
+                GetRequest getRequest => ProcessGetRequest(getRequest),
+                RemoveRequest removeRequest => ProcessRemoveRequest(removeRequest),
+                ErroredRequest erroredRequest => new ErorResponse(erroredRequest.id, ResponseType.error, erroredRequest.error, erroredRequest.rawJson),
+                _ => new ErorResponse(request.id, ResponseType.error, $"Operação não suportada: {request.op}.", JsonSerializer.Serialize(request))
+            };
+
+            AppendResponse(response);
+        }
+    }
+
+    private static SimpleResponse ProcessPutRequest(PutRequest request)
+    {
+        if (metadata.pageTable.ContainsKey(request.key))
+            DeleteInformationAsync(request.key).GetAwaiter().GetResult();
+
+        CreateInformationAsync(request.key, request.value).GetAwaiter().GetResult();
+        return new SimpleResponse(request.id, ResponseType.ok);
+    }
+
+    private static GetResponse ProcessGetRequest(GetRequest request)
+    {
+        try
+        {
+            ulong firstPageId = GetInformationFirstPageId(request.key);
+            string value = ReadInformationAsync(firstPageId).GetAwaiter().GetResult();
+            return new GetResponse(request.id, ResponseType.ok, value);
+        }
+        catch (KeyNotFoundException)
+        {
+            return new GetResponse(request.id, ResponseType.not_found, null);
+        }
+    }
+
+    private static SimpleResponse ProcessRemoveRequest(RemoveRequest request)
+    {
+        DeleteInformationAsync(request.key).GetAwaiter().GetResult();
+        return new SimpleResponse(request.id, ResponseType.ok);
+    }
+
+    private static void AppendResponse(object response)
+    {        
+        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response, ResponseSerializerOptions) + Environment.NewLine);
+    }
+
+    /// <summary>Cria uma página zerada no final do arquivo e retorna seu ID.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a operação.</param>
+    /// <returns>ID da página criada.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando o tamanho do arquivo não é múltiplo do tamanho da página.</exception>
     public static async Task<ulong> CreateEmptyPageAsync(CancellationToken cancellationToken = default)
     {
         await PageAllocationLock.WaitAsync(cancellationToken);
-
         try
         {
-            SafeFileHandle handle = GetPageFileHandle();
-            long fileLength = RandomAccess.GetLength(handle);
-
-            if (fileLength % pageSize != 0)
-                throw new InvalidDataException("O tamanho do arquivo de database não é múltiplo do tamanho da página.");
-
-            ulong pageId = checked((ulong) (fileLength / pageSize));
-            long pageOffset = fileLength;
-            RandomAccess.SetLength(handle, checked(fileLength + pageSize));
-
-            byte[] emptyPage = new byte[pageSize];
-            await RandomAccess.WriteAsync(handle, emptyPage.AsMemory(), pageOffset, cancellationToken);
-
-            return pageId;
+            return await AppendEmptyPageUnsafeAsync(cancellationToken);
         }
         finally
         {
@@ -74,77 +164,44 @@ public static class Engine
         }
     }
 
-    private static async Task InsertPageTableEntryAsync(ulong informationId, ulong firstPageId, CancellationToken cancellationToken = default)
+    /// <summary>Cria uma informação, reutilizando tombstones antes de anexar páginas novas.</summary>
+    /// <param name="informationId">ID lógico da informação.</param>
+    /// <param name="information">Texto a ser armazenado em UTF-8.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a operação.</param>
+    /// <returns>ID da primeira página física da informação.</returns>
+    /// <exception cref="InvalidOperationException">Lançada quando o ID já existe.</exception>
+    public static async Task<ulong> CreateInformationAsync(ulong informationId, string information, CancellationToken cancellationToken = default)
     {
-        const int pagePointerSize = sizeof(ulong);
-        const int firstPageHeaderSize = sizeof(ulong) + sizeof(uint);
-        const int entrySize = sizeof(ulong) * 2;
-        const int firstPageEntriesPerPage = (4096 - firstPageHeaderSize) / entrySize;
-        const int continuationPageEntriesPerPage = (4096 - pagePointerSize) / entrySize;
-
+        ArgumentNullException.ThrowIfNull(information);
         await MetadataLock.WaitAsync(cancellationToken);
-
         try
         {
             if (metadata.pageTable.ContainsKey(informationId))
                 throw new InvalidOperationException($"A informação com ID {informationId} já existe.");
 
-            ulong currentPageId = 0;
-            uint entriesBeforeCurrentPage = 0;
-            bool firstPage = true;
-            var visitedPages = new HashSet<ulong>();
+            byte[] bytes = Encoding.UTF8.GetBytes(information);
+            int contentSize = PageSize - Page.HeaderSize;
+            int pageCount = Math.Max(1, checked((int)(((long)bytes.Length + contentSize - 1) / contentSize)));
+            List<ulong> pageIds = await AllocatePagesUnsafeAsync(pageCount, cancellationToken);
 
-            while (true)
+            int offset = 0;
+            for (int index = 0; index < pageIds.Count; index++)
             {
-                if (!visitedPages.Add(currentPageId))
-                    throw new InvalidDataException("Foi encontrado um ciclo inválido na cadeia da metadata.");
-
-                byte[] currentPage = await ReadPageAsync(currentPageId, pageSize, cancellationToken);
-                ulong nextPageId = BinaryPrimitives.ReadUInt64LittleEndian(currentPage.AsSpan(0, pagePointerSize));
-                int contentOffset = firstPage ? firstPageHeaderSize : pagePointerSize;
-                int entriesPerCurrentPage = firstPage ? firstPageEntriesPerPage : continuationPageEntriesPerPage;
-                uint entriesInCurrentPage = metadata.pageTableSize - entriesBeforeCurrentPage;
-
-                if (entriesInCurrentPage < entriesPerCurrentPage)
+                byte[] page = new byte[PageSize];
+                ulong nextPageId = index + 1 < pageIds.Count ? pageIds[index + 1] : pageIds[index];
+                BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize), nextPageId);
+                int count = Math.Min(contentSize, bytes.Length - offset);
+                if (count > 0)
                 {
-                    int entryOffset = checked(contentOffset + (int)entriesInCurrentPage * entrySize);
-                    await WritePageTableEntryAsync(currentPageId, entryOffset, informationId, firstPageId, cancellationToken);
-                    break;
+                    bytes.AsSpan(offset, count).CopyTo(page.AsSpan(Page.HeaderSize, count));
+                    offset += count;
                 }
-
-                if (nextPageId == currentPageId)
-                {
-                    ulong newPageId = await CreateEmptyPageAsync(cancellationToken);
-                    byte[] newPage = new byte[pageSize];
-                    BinaryPrimitives.WriteUInt64LittleEndian(newPage.AsSpan(0, pagePointerSize), newPageId);
-                    WritePageTableEntry(newPage, pagePointerSize, informationId, firstPageId);
-
-                    long newPageOffset = checked((long)newPageId * pageSize);
-                    await RandomAccess.WriteAsync(GetPageFileHandle(), newPage.AsMemory(), newPageOffset, cancellationToken);
-
-                    byte[] nextPageBytes = new byte[pagePointerSize];
-                    BinaryPrimitives.WriteUInt64LittleEndian(nextPageBytes, newPageId);
-                    long currentPageOffset = checked((long)currentPageId * pageSize);
-                    await RandomAccess.WriteAsync(GetPageFileHandle(), nextPageBytes.AsMemory(), currentPageOffset, cancellationToken);
-
-                    if (currentPageId == 0)
-                        metadata.nextPageId = newPageId;
-
-                    break;
-                }
-
-                entriesBeforeCurrentPage = checked(entriesBeforeCurrentPage + (uint)entriesPerCurrentPage);
-                currentPageId = nextPageId;
-                firstPage = false;
+                await WritePageAsync(pageIds[index], page, cancellationToken);
             }
 
-            uint newPageTableSize = checked(metadata.pageTableSize + 1);
-            byte[] sizeBytes = new byte[sizeof(uint)];
-            BinaryPrimitives.WriteUInt32LittleEndian(sizeBytes, newPageTableSize);
-            await RandomAccess.WriteAsync(GetPageFileHandle(), sizeBytes.AsMemory(), sizeof(ulong), cancellationToken);
-
-            metadata.pageTable.Add(informationId, firstPageId);
-            metadata.pageTableSize = newPageTableSize;
+            metadata.pageTable.Add(informationId, pageIds[0]);
+            metadata.pageTableSize++;
+            return pageIds[0];
         }
         finally
         {
@@ -152,295 +209,423 @@ public static class Engine
         }
     }
 
-    private static async Task WritePageTableEntryAsync(ulong pageId, int offset, ulong informationId, ulong firstPageId, CancellationToken cancellationToken)
-    {
-        byte[] entry = new byte[sizeof(ulong) * 2];
-        WritePageTableEntry(entry, 0, informationId, firstPageId);
-        long fileOffset = checked((long)pageId * pageSize + offset);
-        await RandomAccess.WriteAsync(GetPageFileHandle(), entry.AsMemory(), fileOffset, cancellationToken);
-    }
-
-    private static void WritePageTableEntry(byte[] page, int offset, ulong informationId, ulong firstPageId)
-    {
-        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset, sizeof(ulong)), informationId);
-        BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset + sizeof(ulong), sizeof(ulong)), firstPageId);
-    }
-
-    public static async Task<ulong> CreateInformationAsync(ulong informationId, string information, CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(information);
-
-        const int pagePointerSize = sizeof(ulong);
-        int contentSize = pageSize - pagePointerSize;
-        byte[] informationBytes = Encoding.UTF8.GetBytes(information);
-        int pageCount = informationBytes.Length == 0
-            ? 1
-            : checked((int)(((long)informationBytes.Length + contentSize - 1) / contentSize));
-
-        ulong[] pageIds = new ulong[pageCount];
-        for (int pageIndex = 0; pageIndex < pageIds.Length; pageIndex++)
-            pageIds[pageIndex] = await CreateEmptyPageAsync(cancellationToken);
-
-        SafeFileHandle handle = GetPageFileHandle();
-        int informationOffset = 0;
-
-        for (int pageIndex = 0; pageIndex < pageIds.Length; pageIndex++)
-        {
-            byte[] page = new byte[pageSize];
-            ulong nextPageId = pageIndex + 1 < pageIds.Length
-                ? pageIds[pageIndex + 1]
-                : pageIds[pageIndex];
-
-            BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(0, pagePointerSize), nextPageId);
-
-            int bytesToCopy = Math.Min(contentSize, informationBytes.Length - informationOffset);
-            if (bytesToCopy > 0)
-            {
-                informationBytes.AsSpan(informationOffset, bytesToCopy)
-                    .CopyTo(page.AsSpan(pagePointerSize, bytesToCopy));
-                informationOffset += bytesToCopy;
-            }
-
-            long pageOffset = checked((long)pageIds[pageIndex] * pageSize);
-            await RandomAccess.WriteAsync(handle, page.AsMemory(), pageOffset, cancellationToken);
-        }
-
-        await InsertPageTableEntryAsync(informationId, pageIds[0], cancellationToken);
-        return pageIds[0];
-    }
-
+    /// <summary>Obtém a primeira página física associada a um ID lógico.</summary>
+    /// <param name="informationId">ID lógico consultado.</param>
+    /// <returns>ID da primeira página da informação.</returns>
+    /// <exception cref="KeyNotFoundException">Lançada quando o ID não está na pageTable.</exception>
     public static ulong GetInformationFirstPageId(ulong informationId)
     {
-        if (!metadata.pageTable.TryGetValue(informationId, out ulong firstPageId))
-            throw new KeyNotFoundException($"A informação com ID {informationId} não foi encontrada na pageTable.");
-
-        return firstPageId;
+        if (!metadata.pageTable.TryGetValue(informationId, out ulong pageId))
+            throw new KeyNotFoundException($"A informação com ID {informationId} não foi encontrada.");
+        return pageId;
     }
 
+    /// <summary>Lê todas as páginas encadeadas de uma informação e reconstrói seu texto UTF-8.</summary>
+    /// <param name="firstPageId">ID da primeira página da informação.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>Texto armazenado.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando a cadeia contém um ciclo inválido.</exception>
     public static async Task<string> ReadInformationAsync(ulong firstPageId, CancellationToken cancellationToken = default)
     {
-        const int pagePointerSize = sizeof(ulong);
-        var informationBytes = new List<byte>();
-        var visitedPages = new HashSet<ulong>();
-        ulong currentPageId = firstPageId;
-
+        var bytes = new List<byte>();
+        var visited = new HashSet<ulong>();
+        ulong current = firstPageId;
         while (true)
         {
-            if (!visitedPages.Add(currentPageId))
+            if (!visited.Add(current))
                 throw new InvalidDataException("Foi encontrado um ciclo inválido nas páginas da informação.");
-
-            byte[] page = await ReadPageAsync(currentPageId, pageSize, cancellationToken);
-            ulong nextPageId = BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(0, pagePointerSize));
-            informationBytes.AddRange(page.AsSpan(pagePointerSize).ToArray());
-
-            if (nextPageId == currentPageId)
+            byte[] page = await ReadPageAsync(current, PageSize, cancellationToken);
+            ulong next = BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize));
+            bytes.AddRange(page.AsSpan(Page.HeaderSize).ToArray());
+            if (next == current)
                 break;
-
-            currentPageId = nextPageId;
+            current = next;
         }
-
-        int contentLength = informationBytes.Count;
-        while (contentLength > 0 && informationBytes[contentLength - 1] == 0)
-            contentLength--;
-
-        return Encoding.UTF8.GetString(informationBytes.ToArray(), 0, contentLength);
+        int length = bytes.Count;
+        while (length > 0 && bytes[length - 1] == 0)
+            length--;
+        return Encoding.UTF8.GetString(bytes.ToArray(), 0, length);
     }
 
-    public static void AddRequest(Request request)
+    /// <summary>Remove uma informação e marca todas as suas páginas como tombstones.</summary>
+    /// <param name="informationId">ID lógico da informação a remover.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura das páginas.</param>
+    /// <returns>Indica se a informação existia e foi removida.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando a cadeia da informação é inválida.</exception>
+    public static async Task<bool> DeleteInformationAsync(ulong informationId, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(request);
-
-        RequestQueue.Enqueue(request);
-
-        if (RequestQueue.Count >= QueueCapacity)
-            ProcessQueue();        
-    }
-
-    public static void ProcessQueue()
-    {
-        throw new NotImplementedException();
-
-        while (RequestQueue.Count > 0)
+        await MetadataLock.WaitAsync(cancellationToken);
+        try
         {
-            RequestQueue.Dequeue();
-        }
-    }
+            if (!metadata.pageTable.Remove(informationId, out ulong firstPageId))
+                return false;
+            metadata.pageTableSize--;
 
-    
-
-    /// <summary>
-    /// Carrega da memória secundária os metadados da database, incluindo a tabela de páginas
-    /// </summary>    
-    /// <returns>A metadata carregada</returns>
-    /// <exception cref="InvalidDataException">Retorna erro caso seja detectado erro no arquivo de database</exception>
-    private static async Task<Metadata> LoadMetadataAsync(CancellationToken cancellationToken = default)
-    {
-        const ulong metadataPageId = 0;
-        const int metadataHeaderSize = sizeof(ulong) + sizeof(uint);
-        const int pagePointerSize = sizeof(ulong);
-        const int pairSize = sizeof(ulong) * 2;
-
-        byte[] firstPage = await ReadPageAsync(metadataPageId, pageSize, cancellationToken);
-        
-        ulong firstNextPageId = BinaryPrimitives.ReadUInt64LittleEndian(firstPage.AsSpan(0, sizeof(ulong)));
-        uint pageTableSize = BinaryPrimitives.ReadUInt32LittleEndian(firstPage.AsSpan(sizeof(ulong), sizeof(uint)));
-
-        var loadedMetadata = new Metadata
-        {
-            nextPageId = firstNextPageId,
-            pageTableSize = pageTableSize
-        };
-
-        var visitedPages = new HashSet<ulong>();
-        byte[] pairBuffer = new byte[pairSize];
-        int pairBufferLength = 0;
-        uint entriesRead = 0;
-        ulong currentPageId = metadataPageId;
-        byte[] currentPage = firstPage;
-
-        while (entriesRead < pageTableSize)
-        {
-            if (!visitedPages.Add(currentPageId))
-                throw new InvalidDataException("Foi encontrado um ciclo nas páginas da metadata antes do fim da pageTable.");
-
-            ulong nextMetadataPageId = BinaryPrimitives.ReadUInt64LittleEndian(currentPage.AsSpan(0, pagePointerSize));
-            bool isFirstMetadataPage = currentPageId == metadataPageId;
-            int contentOffset = isFirstMetadataPage ? metadataHeaderSize : pagePointerSize;
-
-            for (int offset = contentOffset; offset < currentPage.Length && entriesRead < pageTableSize; offset++)
+            var visited = new HashSet<ulong>();
+            ulong current = firstPageId;
+            while (true)
             {
-                pairBuffer[pairBufferLength++] = currentPage[offset];
-
-                if (pairBufferLength != pairSize)
-                    continue;
-
-                ulong dataId = BinaryPrimitives.ReadUInt64LittleEndian(pairBuffer.AsSpan(0, sizeof(ulong)));
-                ulong dataFirstPageId = BinaryPrimitives.ReadUInt64LittleEndian(pairBuffer.AsSpan(sizeof(ulong), sizeof(ulong)));
-                loadedMetadata.pageTable.Add(dataId, dataFirstPageId);
-                entriesRead++;
-                pairBufferLength = 0;
+                if (!visited.Add(current))
+                    throw new InvalidDataException("Foi encontrado um ciclo inválido nas páginas da informação.");
+                byte[] page = await ReadPageAsync(current, PageSize, cancellationToken);
+                ulong next = BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize));
+                DeletePage(current);
+                if (next == current)
+                    break;
+                current = next;
             }
-
-            if (entriesRead == pageTableSize)
-                break;
-
-            if (nextMetadataPageId == currentPageId)
-                throw new InvalidDataException("A página da metadata aponta para si mesma antes do fim da pageTable.");
-
-            currentPageId = nextMetadataPageId;
-            currentPage = await ReadPageAsync(currentPageId, pageSize, cancellationToken);
+            return true;
         }
-
-        if (pairBufferLength != 0)
-            throw new InvalidDataException("A pageTable da metadata está truncada.");
-
-        return loadedMetadata;
+        finally
+        {
+            MetadataLock.Release();
+        }
     }
 
-
-
-    /// <summary>
-    /// Cria um novo arquivo de database
-    /// </summary>    
-    /// <returns>Retorna verdadeiro se o arquivo foi criado com sucesso</returns>
-    private static async Task<bool> CreateDatabaseFileAsync(CancellationToken cancellationToken = default)
+    /// <summary>Marca uma página como livre na tombstone table e atualiza o índice de intervalos.</summary>
+    /// <param name="pageId">ID da página liberada.</param>
+    /// <summary>Adiciona uma página liberada à tombstone table em memória.</summary>
+    /// <param name="pageId">ID da página que deixou de ser usada.</param>
+    private static void DeletePage(ulong pageId)
     {
-        SafeFileHandle handle = GetPageFileHandle();
-
-        byte[] metadataPage = new byte[pageSize];
-        BinaryPrimitives.WriteUInt64LittleEndian(metadataPage.AsSpan(0, sizeof(ulong)), 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(metadataPage.AsSpan(sizeof(ulong), sizeof(uint)), 0);
-
-        await RandomAccess.WriteAsync(handle, metadataPage.AsMemory(), 0, cancellationToken);
-        return true;
+        int index = metadata.tombstoneTable.BinarySearch(pageId);
+        if (index < 0)
+        {
+            metadata.tombstoneTable.Insert(~index, pageId);
+            metadata.tombstoneTableSize++;
+            metadata.freePageIntervals.AddPage(pageId);
+        }
     }
 
-    /// <summary>
-    /// Método para ler uma página do arquivo de database
-    /// </summary>
-    /// <param name="pageId">ID da página que está sendo buscada</param>
-    /// <param name="pageSize">O tamanho de todas as páginas do arquivo de database</param>    
-    /// <returns>Bytes da página</returns>
-    /// <exception cref="ArgumentOutOfRangeException">Se a página não for válida</exception>
+    /// <summary>Salva a pageTable e a tombstoneTable, atualizando o header da página 0.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a gravação.</param>
+    /// <exception cref="InvalidDataException">Lançada quando uma tabela não pode ser serializada.</exception>
+    public static async Task SaveTablesAsync(CancellationToken cancellationToken = default)
+    {
+        await MetadataLock.WaitAsync(cancellationToken);
+        try
+        {
+            List<ulong> oldPageTablePages = await ReadTablePageIdsAsync(metadata.pageTablePageId, metadata.pageTableSize, PageTableEntrySize, cancellationToken);
+            int pageTableCapacity = (PageSize - Page.HeaderSize) / PageTableEntrySize;
+            int requiredPageTablePages = Math.Max(1, (int)(((long)metadata.pageTableSize + pageTableCapacity - 1) / pageTableCapacity));
+            while (oldPageTablePages.Count < requiredPageTablePages)
+                oldPageTablePages.Add(await AppendEmptyPageUnsafeAsync(cancellationToken));
+            for (int i = requiredPageTablePages; i < oldPageTablePages.Count; i++)
+                DeletePage(oldPageTablePages[i]);
+            oldPageTablePages = oldPageTablePages.Take(requiredPageTablePages).ToList();
+            await WritePageTableAsync(oldPageTablePages, cancellationToken);
+            metadata.pageTablePageId = oldPageTablePages[0];
+
+            List<ulong> oldTombstonePages = await ReadTablePageIdsAsync(metadata.tombstoneTablePageId, metadata.tombstoneTableSize, TombstoneEntrySize, cancellationToken);
+            int tombstoneCapacity = (PageSize - Page.HeaderSize) / TombstoneEntrySize;
+            int requiredTombstonePages = Math.Max(1, (int)(((long)metadata.tombstoneTableSize + tombstoneCapacity - 1) / tombstoneCapacity));
+            for (int i = requiredTombstonePages; i < oldTombstonePages.Count; i++)
+                DeletePage(oldTombstonePages[i]);
+            requiredTombstonePages = Math.Max(1, (int)(((long)metadata.tombstoneTableSize + tombstoneCapacity - 1) / tombstoneCapacity));
+            while (oldTombstonePages.Count < requiredTombstonePages)
+                oldTombstonePages.Add(await AppendEmptyPageUnsafeAsync(cancellationToken));
+            oldTombstonePages = oldTombstonePages.Take(requiredTombstonePages).ToList();
+            await WriteTombstoneTableAsync(oldTombstonePages, cancellationToken);
+            metadata.tombstoneTablePageId = oldTombstonePages[0];
+
+            await WriteMetadataHeaderAsync(cancellationToken);
+        }
+        finally
+        {
+            MetadataLock.Release();
+        }
+    }
+
+    /// <summary>Lê uma página do arquivo em um offset calculado pelo ID e tamanho informado.</summary>
+    /// <param name="pageId">ID da página.</param>
+    /// <param name="pageSize">Tamanho da página em bytes.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>Bytes lidos, preenchidos com zero quando o arquivo termina antes da página.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Lançada para tamanho ou ID que excedam os offsets suportados.</exception>
     public static async Task<byte[]> ReadPageAsync(ulong pageId, int pageSize, CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pageSize);
-
-        ulong offsetValue;
-
-        try
-        {
-            offsetValue = checked(pageId * (ulong) pageSize);
-        }
-        catch (OverflowException)
-        {
-            throw new ArgumentOutOfRangeException(nameof(pageId), "O offset da página excede o limite suportado.");
-        }
-
-        if (offsetValue > long.MaxValue || offsetValue > (ulong) (long.MaxValue - pageSize))
-        {
-            throw new ArgumentOutOfRangeException(nameof(pageId), "O offset da página excede o limite suportado.");
-        }
-
-        SafeFileHandle handle = GetPageFileHandle();
-
+        ulong offsetValue = checked(pageId * (ulong)pageSize);
+        if (offsetValue > long.MaxValue || offsetValue > (ulong)(long.MaxValue - pageSize))
+            throw new ArgumentOutOfRangeException(nameof(pageId));
         byte[] page = new byte[pageSize];
-        long offset = (long) offsetValue;
-        int bytesRead = 0;
-
-        while (bytesRead < page.Length)
+        int readBytes = 0;
+        while (readBytes < page.Length)
         {
-            int read = await RandomAccess.ReadAsync(handle, page.AsMemory(bytesRead), offset + bytesRead, cancellationToken);
-
+            int read = await RandomAccess.ReadAsync(GetPageFileHandle(), page.AsMemory(readBytes), (long)offsetValue + readBytes, cancellationToken);
             if (read == 0)
-            {
                 break;
-            }
-
-            bytesRead += read;
+            readBytes += read;
         }
-
         return page;
     }
 
+    /// <summary>Carrega o header e as duas tabelas persistidas no arquivo.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>Metadata reconstruída em memória.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando alguma tabela possui formato inválido.</exception>
+    private static async Task<Metadata> LoadMetadataAsync(CancellationToken cancellationToken)
+    {
+        byte[] header = await ReadPageAsync(0, PageSize, cancellationToken);
+        var loaded = new Metadata
+        {
+            pageTablePageId = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(0, sizeof(ulong))),
+            pageTableSize = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(sizeof(ulong), sizeof(uint))),
+            tombstoneTablePageId = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(sizeof(ulong) + sizeof(uint), sizeof(ulong))),
+            tombstoneTableSize = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(sizeof(ulong) * 2 + sizeof(uint), sizeof(uint)))
+        };
+        loaded.pageTable = await LoadPageTableAsync(loaded.pageTablePageId, loaded.pageTableSize, cancellationToken);
+        loaded.tombstoneTable = await LoadTombstoneTableAsync(loaded.tombstoneTablePageId, loaded.tombstoneTableSize, cancellationToken);
+        loaded.freePageIntervals.Rebuild(loaded.tombstoneTable);
+        return loaded;
+    }
+
+    /// <summary>Cria o arquivo inicial com o header e as páginas reservadas das tabelas.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a criação.</param>
+    private static async Task CreateDatabaseFileAsync(CancellationToken cancellationToken)
+    {
+        CreatePageFileHandle(FileMode.CreateNew);
+        RandomAccess.SetLength(GetPageFileHandle(), (long)PageSize * 3);
+        byte[] header = new byte[PageSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(0, sizeof(ulong)), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(sizeof(ulong), sizeof(uint)), 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(sizeof(ulong) + sizeof(uint), sizeof(ulong)), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(sizeof(ulong) * 2 + sizeof(uint), sizeof(uint)), 0);
+        await WritePageAsync(0, header, cancellationToken);
+        await WriteTablePagePointerAsync(1, 1, cancellationToken);
+        await WriteTablePagePointerAsync(2, 2, cancellationToken);
+    }
+
+    /// <summary>Seleciona páginas livres ou anexa novas páginas sem adquirir novamente o lock de alocação.</summary>
+    /// <param name="count">Quantidade de páginas necessária.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a operação.</param>
+    /// <returns>IDs das páginas selecionadas.</returns>
+    /// <exception cref="InvalidOperationException">Lançada quando não há páginas livres suficientes para a seleção.</exception>
+    private static async Task<List<ulong>> AllocatePagesUnsafeAsync(int count, CancellationToken cancellationToken)
+    {
+        await PageAllocationLock.WaitAsync(cancellationToken);
+        try
+        {
+            List<ulong> ids;
+            if (!metadata.freePageIntervals.TryTakeContiguous(count, out ids))
+            {
+                ids = metadata.tombstoneTable.Count >= count
+                    ? metadata.freePageIntervals.TakeAny(count)
+                    : metadata.tombstoneTable.ToList();
+                if (ids.Count < count)
+                {
+                    int missing = count - ids.Count;
+                    for (int i = 0; i < missing; i++)
+                        ids.Add(await AppendEmptyPageUnsafeAsync(cancellationToken));
+                }
+            }
+            foreach (ulong id in ids)
+            {
+                int index = metadata.tombstoneTable.BinarySearch(id);
+                if (index >= 0)
+                    metadata.tombstoneTable.RemoveAt(index);
+            }
+            metadata.tombstoneTableSize = (uint)metadata.tombstoneTable.Count;
+            metadata.freePageIntervals.Rebuild(metadata.tombstoneTable);
+            return ids;
+        }
+        finally
+        {
+            PageAllocationLock.Release();
+        }
+    }
+
+    /// <summary>Anexa uma página zerada sem adquirir novamente o lock de alocação.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    /// <returns>ID da página anexada.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando o tamanho do arquivo não é múltiplo do tamanho da página.</exception>
+    private static async Task<ulong> AppendEmptyPageUnsafeAsync(CancellationToken cancellationToken)
+    {
+        SafeFileHandle handle = GetPageFileHandle();
+        long length = RandomAccess.GetLength(handle);
+        if (length % PageSize != 0)
+            throw new InvalidDataException("O tamanho do arquivo não é múltiplo do tamanho da página.");
+        ulong pageId = checked((ulong)(length / PageSize));
+        RandomAccess.SetLength(handle, checked(length + PageSize));
+        await WritePageAsync(pageId, new byte[PageSize], cancellationToken);
+        return pageId;
+    }
+
+    /// <summary>Grava uma página completa no offset correspondente ao seu ID.</summary>
+    /// <param name="pageId">ID da página.</param>
+    /// <param name="page">Buffer completo da página.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    private static async Task WritePageAsync(ulong pageId, byte[] page, CancellationToken cancellationToken)
+    {
+        long offset = checked((long)pageId * PageSize);
+        await RandomAccess.WriteAsync(GetPageFileHandle(), page.AsMemory(), offset, cancellationToken);
+    }
+
+    /// <summary>Grava somente o ponteiro de próxima página de uma página de tabela.</summary>
+    /// <param name="pageId">Página cujo ponteiro será gravado.</param>
+    /// <param name="nextPageId">ID da próxima página ou da própria página.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    private static async Task WriteTablePagePointerAsync(ulong pageId, ulong nextPageId, CancellationToken cancellationToken)
+    {
+        byte[] pointer = new byte[Page.HeaderSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(pointer, nextPageId);
+        await RandomAccess.WriteAsync(GetPageFileHandle(), pointer.AsMemory(), checked((long)pageId * PageSize), cancellationToken);
+    }
+
+    /// <summary>Persiste o header da metadata na página zero.</summary>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    private static async Task WriteMetadataHeaderAsync(CancellationToken cancellationToken)
+    {
+        byte[] header = new byte[Metadata.HeaderSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(0, sizeof(ulong)), metadata.pageTablePageId);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(sizeof(ulong), sizeof(uint)), metadata.pageTableSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(sizeof(ulong) + sizeof(uint), sizeof(ulong)), metadata.tombstoneTablePageId);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(sizeof(ulong) * 2 + sizeof(uint), sizeof(uint)), metadata.tombstoneTableSize);
+        await RandomAccess.WriteAsync(GetPageFileHandle(), header.AsMemory(), 0, cancellationToken);
+    }
+
+    /// <summary>Obtém todos os IDs da cadeia física de uma tabela.</summary>
+    /// <param name="firstPageId">Primeira página da tabela.</param>
+    /// <param name="size">Quantidade de entradas da tabela.</param>
+    /// <param name="entrySize">Tamanho de cada entrada em bytes.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>IDs das páginas físicas da tabela.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando a cadeia tem ciclo ou páginas insuficientes.</exception>
+    private static async Task<List<ulong>> ReadTablePageIdsAsync(ulong firstPageId, uint size, int entrySize, CancellationToken cancellationToken)
+    {
+        int capacity = (PageSize - Page.HeaderSize) / entrySize;
+        int requiredCount = Math.Max(1, (int)(((long)size + capacity - 1) / capacity));
+        var ids = new List<ulong>();
+        var visited = new HashSet<ulong>();
+        ulong current = firstPageId;
+
+        while (true)
+        {
+            if (!visited.Add(current))
+                throw new InvalidDataException("A cadeia de páginas da tabela contém um ciclo inválido.");
+            ids.Add(current);
+            byte[] page = await ReadPageAsync(current, PageSize, cancellationToken);
+            ulong next = BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize));
+            if (next == current)
+                break;
+            current = next;
+        }
+
+        if (ids.Count < requiredCount)
+            throw new InvalidDataException("A tabela termina antes de armazenar todos os elementos.");
+        return ids;
+    }
+
+    /// <summary>Carrega pares de IDs da pageTable a partir das páginas persistidas.</summary>
+    /// <param name="firstPageId">Primeira página da pageTable.</param>
+    /// <param name="size">Quantidade de pares esperados.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>Dicionário reconstruído.</returns>
+    private static async Task<Dictionary<ulong, ulong>> LoadPageTableAsync(ulong firstPageId, uint size, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<ulong, ulong>();
+        List<ulong> pages = await ReadTablePageIdsAsync(firstPageId, size, PageTableEntrySize, cancellationToken);
+        int remaining = checked((int)size);
+        foreach (ulong pageId in pages)
+        {
+            byte[] page = await ReadPageAsync(pageId, PageSize, cancellationToken);
+            int count = Math.Min(remaining, (PageSize - Page.HeaderSize) / PageTableEntrySize);
+            for (int i = 0; i < count; i++)
+            {
+                int offset = Page.HeaderSize + i * PageTableEntrySize;
+                result.Add(BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(offset, sizeof(ulong))), BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(offset + sizeof(ulong), sizeof(ulong))));
+            }
+            remaining -= count;
+        }
+        return result;
+    }
+
+    /// <summary>Carrega e valida os IDs ordenados da tombstone table.</summary>
+    /// <param name="firstPageId">Primeira página da tombstone table.</param>
+    /// <param name="size">Quantidade de IDs esperados.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a leitura.</param>
+    /// <returns>Lista ordenada de IDs de páginas livres.</returns>
+    /// <exception cref="InvalidDataException">Lançada quando a tabela não está ordenada.</exception>
+    private static async Task<List<ulong>> LoadTombstoneTableAsync(ulong firstPageId, uint size, CancellationToken cancellationToken)
+    {
+        var result = new List<ulong>(checked((int)size));
+        List<ulong> pages = await ReadTablePageIdsAsync(firstPageId, size, TombstoneEntrySize, cancellationToken);
+        int remaining = checked((int)size);
+        foreach (ulong pageId in pages)
+        {
+            byte[] page = await ReadPageAsync(pageId, PageSize, cancellationToken);
+            int count = Math.Min(remaining, (PageSize - Page.HeaderSize) / TombstoneEntrySize);
+            for (int i = 0; i < count; i++)
+                result.Add(BinaryPrimitives.ReadUInt64LittleEndian(page.AsSpan(Page.HeaderSize + i * TombstoneEntrySize, sizeof(ulong))));
+            remaining -= count;
+        }
+        if (!result.SequenceEqual(result.OrderBy(id => id)))
+            throw new InvalidDataException("A tombstoneTable não está ordenada.");
+        return result;
+    }
+
+    /// <summary>Serializa a pageTable nas páginas físicas fornecidas.</summary>
+    /// <param name="pages">Páginas que armazenarão a tabela.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    private static async Task WritePageTableAsync(List<ulong> pages, CancellationToken cancellationToken)
+    {
+        int capacity = (PageSize - Page.HeaderSize) / PageTableEntrySize;
+        for (int pageIndex = 0; pageIndex < pages.Count; pageIndex++)
+        {
+            byte[] page = new byte[PageSize];
+            ulong next = pageIndex + 1 < pages.Count ? pages[pageIndex + 1] : pages[pageIndex];
+            BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize), next);
+            int first = pageIndex * capacity;
+            int count = Math.Min(capacity, metadata.pageTable.Count - first);
+            for (int i = 0; i < count; i++)
+            {
+                var pair = metadata.pageTable.ElementAt(first + i);
+                int offset = Page.HeaderSize + i * PageTableEntrySize;
+                BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset, sizeof(ulong)), pair.Key);
+                BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(offset + sizeof(ulong), sizeof(ulong)), pair.Value);
+            }
+            await WritePageAsync(pages[pageIndex], page, cancellationToken);
+        }
+    }
+
+    /// <summary>Serializa a tombstone table ordenada nas páginas físicas fornecidas.</summary>
+    /// <param name="pages">Páginas que armazenarão a tabela.</param>
+    /// <param name="cancellationToken">Token usado para cancelar a escrita.</param>
+    private static async Task WriteTombstoneTableAsync(List<ulong> pages, CancellationToken cancellationToken)
+    {
+        int capacity = (PageSize - Page.HeaderSize) / TombstoneEntrySize;
+        for (int pageIndex = 0; pageIndex < pages.Count; pageIndex++)
+        {
+            byte[] page = new byte[PageSize];
+            ulong next = pageIndex + 1 < pages.Count ? pages[pageIndex + 1] : pages[pageIndex];
+            BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(0, Page.HeaderSize), next);
+            int first = pageIndex * capacity;
+            int count = Math.Min(capacity, metadata.tombstoneTable.Count - first);
+            for (int i = 0; i < count; i++)
+                BinaryPrimitives.WriteUInt64LittleEndian(page.AsSpan(Page.HeaderSize + i * TombstoneEntrySize, sizeof(ulong)), metadata.tombstoneTable[first + i]);
+            await WritePageAsync(pages[pageIndex], page, cancellationToken);
+        }
+    }
+
+    /// <summary>Obtém o handle compartilhado do arquivo de database.</summary>
+    /// <returns>Handle aberto para leitura e escrita assíncronas.</returns>
     private static SafeFileHandle GetPageFileHandle()
     {
         if (pageFileHandle is not null)
-        {
             return pageFileHandle;
-        }
-        else
-        {
-            CreatePageFileHandle();
-            return pageFileHandle;
-        }        
+        CreatePageFileHandle(FileMode.OpenOrCreate);
+        return pageFileHandle!;
     }
 
-    private static void CreatePageFileHandle(string filePath = DatabaseFileName)
+    /// <summary>Cria ou abre o handle compartilhado usando o modo informado.</summary>
+    /// <param name="mode">Modo de abertura do arquivo.</param>
+    private static void CreatePageFileHandle(FileMode mode)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
-
         lock (PageFileHandleLock)
         {
             pageFileHandle?.Dispose();
-            pageFileHandle = File.OpenHandle(
-                filePath,
-                FileMode.OpenOrCreate,
-                FileAccess.ReadWrite,
-                FileShare.ReadWrite,
-                FileOptions.Asynchronous);
+            pageFileHandle = File.OpenHandle(DatabaseFileName, mode, FileAccess.ReadWrite, FileShare.ReadWrite, FileOptions.Asynchronous);
         }
     }
-        
-
-    // TODO: Função para apagar um informação de um ID, continuamente apagando todas as páginas dessa informação
-    // TODO: Guardar uma tabela com todas as páginas que não estão sendo usadas atualmente para guardar informações, e quando criar novas páginas
-    //       puxar a primeira página zerada marcada como livre
-    // TODO: Implementar uma cache à nível de informação, mantendo as informações mais acessadas na memória principal. Se essa memória for atualizada,
-    //       atualizar ela na memória secundária também
-    // TODO: Implementar uma cache à nível de páginas, mantendo as páginas mais acessadas na memória principal. Se essa página for atualizada, 
-    //       atualizar ela na memória secundária também    
-    // TODO: Implementar o ProcessQueue para processar os diferentes tipos de request 
-    // TODO: Implementar um método para escrever o arquivo final de resposta para todos os requests (.jsonl de respostas de todos os requests)
 
 }
