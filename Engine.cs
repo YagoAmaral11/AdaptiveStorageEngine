@@ -2,6 +2,7 @@ using Microsoft.Win32.SafeHandles;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AdaptiveStorageEngine;
 
@@ -134,7 +135,11 @@ public static class Engine
 
     private static void AppendResponse(object response)
     {
-        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response) + Environment.NewLine);
+        JsonSerializerOptions options = new();
+
+        options.Converters.Add(new JsonStringEnumConverter());
+
+        File.AppendAllText(responseFilePath, JsonSerializer.Serialize(response, options) + Environment.NewLine);
     }
 
     /// <summary>Cria uma página zerada no final do arquivo e retorna seu ID.</summary>
